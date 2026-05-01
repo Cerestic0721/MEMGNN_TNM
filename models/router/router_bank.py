@@ -27,16 +27,20 @@ class SparseRouterBank(nn.Module):
 
     Parameters
     ----------
-    dim:               Feature dimension.
-    num_routers:       Number of prototype slots K.
-    topk:              Number of active slots per node.
-    tau:               Softmax temperature.
-    ema_beta:          EMA decay for prototype update (0 = no EMA, use grad).
-    update_mode:       'grad' (gradient) or 'ema'.
-    init_mode:         'default' | 'gaussian_normalized' | 'gaussian_scaled' | 'qr_orthogonal'.
-    init_var:          Variance for gaussian init modes.
-    normalize_router:  L2-normalize prototypes before similarity.
-    m_step_interval:   EMA update every N forward calls (1 = every step).
+    dim:                    Feature dimension.
+    num_routers:            Number of prototype slots K.
+    topk:                   Number of active slots per node.
+    tau:                    Softmax temperature.
+    ema_beta:               EMA decay for prototype update (0 = no EMA, use grad).
+    update_mode:            'grad' (gradient) or 'ema'.
+    init_mode:              'default' | 'gaussian_normalized' | 'gaussian_scaled' | 'qr_orthogonal'.
+    init_var:               Variance for gaussian init modes.
+    normalize_router:       L2-normalize prototypes before similarity.
+    m_step_interval:        EMA update every N forward calls (1 = every step).
+    use_measure_space:      Apply a frozen orthogonal transform before similarity.
+    measure_transform_type: 'identity' | 'frozen_qr_orthogonal' | 'frozen_hadamard_sign'.
+    measure_apply_mode:     'none' | 'route_only' | 'context_only' | 'route_and_context'.
+    measure_seed:           RNG seed for the frozen transform matrix.
     """
 
     def __init__(
@@ -51,6 +55,10 @@ class SparseRouterBank(nn.Module):
         init_var: float = 1.0,
         normalize_router: bool = False,
         m_step_interval: int = 1,
+        use_measure_space: bool = False,
+        measure_transform_type: str = "frozen_qr_orthogonal",
+        measure_apply_mode: str = "route_only",
+        measure_seed: int = 42,
     ):
         super().__init__()
         self.dim = dim
@@ -61,6 +69,19 @@ class SparseRouterBank(nn.Module):
         self.update_mode = update_mode
         self.normalize_router = normalize_router
         self.m_step_interval = m_step_interval
+        self.use_measure_space = use_measure_space
+        self.measure_transform_type = measure_transform_type
+        self.measure_apply_mode = measure_apply_mode
+        self.measure_seed = measure_seed
+
+        if measure_transform_type not in ("identity", "frozen_qr_orthogonal", "frozen_hadamard_sign"):
+            raise ValueError(
+                "measure_transform_type must be identity | frozen_qr_orthogonal | frozen_hadamard_sign"
+            )
+        if measure_apply_mode not in ("none", "route_only", "context_only", "route_and_context"):
+            raise ValueError(
+                "measure_apply_mode must be none | route_only | context_only | route_and_context"
+            )
 
         self._step = 0
 
@@ -70,6 +91,57 @@ class SparseRouterBank(nn.Module):
             self.register_buffer("P", P)
         else:
             self.P = nn.Parameter(P)
+
+        # Frozen measure-space transform matrix: [d, d]
+        measure_matrix = self._build_measure_matrix(dim)
+        self.register_buffer("measure_matrix", measure_matrix)
+
+    # ------------------------------------------------------------------
+    # Measure space helpers
+    # ------------------------------------------------------------------
+
+    def _build_measure_matrix(self, hidden_dim: int) -> torch.Tensor:
+        if not self.use_measure_space or self.measure_transform_type == "identity":
+            return torch.eye(hidden_dim)
+        if self.measure_transform_type == "frozen_qr_orthogonal":
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(self.measure_seed)
+            gaussian = torch.randn(hidden_dim, hidden_dim, generator=generator)
+            q, r = torch.linalg.qr(gaussian)
+            signs = torch.sign(torch.diag(r))
+            signs = torch.where(signs == 0, torch.ones_like(signs), signs)
+            return q * signs.unsqueeze(0)
+        # frozen_hadamard_sign
+        if hidden_dim & (hidden_dim - 1) != 0:
+            raise ValueError("frozen_hadamard_sign requires hidden_dim to be a power of two")
+        hadamard = torch.tensor([[1.0]])
+        while hadamard.size(0) < hidden_dim:
+            hadamard = torch.cat([
+                torch.cat([hadamard, hadamard], dim=1),
+                torch.cat([hadamard, -hadamard], dim=1),
+            ], dim=0)
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(self.measure_seed)
+        signs = torch.randint(0, 2, (hidden_dim,), generator=generator, dtype=torch.float32)
+        signs = signs.mul_(2.0).sub_(1.0)
+        return (hadamard / hidden_dim ** 0.5) * signs.unsqueeze(0)
+
+    def _transformed_prototypes(self, p: torch.Tensor) -> torch.Tensor:
+        if not self.use_measure_space or self.measure_transform_type == "identity":
+            return p
+        return p @ self.measure_matrix.to(device=p.device, dtype=p.dtype)
+
+    def route_prototypes(self, p: torch.Tensor) -> torch.Tensor:
+        """Prototypes used for computing routing logits (assignment)."""
+        if self.measure_apply_mode in ("route_only", "route_and_context"):
+            return self._transformed_prototypes(p)
+        return p
+
+    def context_prototypes(self, p: torch.Tensor) -> torch.Tensor:
+        """Prototypes used for computing context vectors."""
+        if self.measure_apply_mode in ("context_only", "route_and_context"):
+            return self._transformed_prototypes(p)
+        return p
 
     # ------------------------------------------------------------------
     # Forward
@@ -90,7 +162,8 @@ class SparseRouterBank(nn.Module):
         q_sparse : [N, K] — top-k truncated and renormalized
         """
         P = F.normalize(self.P, dim=-1) if self.normalize_router else self.P
-        logits = h @ P.t() / self.tau          # [N, K]
+        P_route = self.route_prototypes(P)
+        logits = h @ P_route.t() / self.tau  # [N, K]
         q_dense = F.softmax(logits, dim=-1)    # [N, K]
         q_sparse = _topk_normalize(q_dense, self.topk)
         return q_dense, q_sparse
@@ -107,7 +180,8 @@ class SparseRouterBank(nn.Module):
         [N, d]
         """
         P = F.normalize(self.P, dim=-1) if self.normalize_router else self.P
-        return q @ P                           # [N, d]
+        P_ctx = self.context_prototypes(P)
+        return q @ P_ctx                       # [N, d]
 
     def ema_update(
         self,

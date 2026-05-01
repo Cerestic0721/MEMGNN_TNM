@@ -10,7 +10,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv, GCNConv, GINConv, GatedGraphConv
+from torch_geometric.nn import GATConv, GCNConv, GINConv, GatedGraphConv, GCN2Conv
 
 # Per-type defaults matching bottleneck/common.py
 _GNN_DEFAULTS = {
@@ -103,3 +103,51 @@ def _build_conv(gnn_type: str, in_dim: int, out_dim: int) -> nn.Module:
         return GATConv(in_dim, out_dim // heads, heads=heads, concat=True)
 
     raise ValueError(gnn_type)
+
+
+class GCNIILayer(nn.Module):
+    """Single GCNII layer (GCN2Conv) with initial residual connection.
+
+    Unlike GNNLayer, requires h0 (initial node embedding) at each forward call,
+    matching the GCNII update rule: H_l = (1-alpha)*A_hat*H_{l-1} + alpha*H_0.
+
+    Parameters
+    ----------
+    hidden_dim:      Feature dimension (input == output for GCNII).
+    alpha:           Initial residual weight.
+    theta:           Identity mapping strength (beta_l = log(theta/l + 1)).
+    layer:           Layer index (1-based), used to compute beta_l.
+    shared_weights:  Share W_1 and W_2 in GCN2Conv.
+    dropout:         Dropout applied to h before conv.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        alpha: float = 0.1,
+        theta: float = 0.5,
+        layer: int = 1,
+        shared_weights: bool = True,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.dropout = dropout
+        self.conv = GCN2Conv(
+            channels=hidden_dim,
+            alpha=alpha,
+            theta=theta,
+            layer=layer,
+            shared_weights=shared_weights,
+            cached=False,
+            add_self_loops=True,
+            normalize=True,
+        )
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        h0: torch.Tensor,
+        edge_index: torch.Tensor,
+    ) -> torch.Tensor:
+        h = F.dropout(h, self.dropout, training=self.training)
+        return F.relu(self.conv(h, h0, edge_index))

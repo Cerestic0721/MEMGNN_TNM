@@ -51,12 +51,18 @@ def parse_args(argv=None):
     # Model
     p.add_argument("--model",     choices=["baseline", "router_post_gnn", "router_graph_memory"],
                    default="baseline")
-    p.add_argument("--gnn_type",  choices=["GCN", "GIN", "GAT", "GGNN"], default="GCN")
+    p.add_argument("--gnn_type",  choices=["GCN", "GIN", "GAT", "GGNN", "GCNII"], default="GCN")
     p.add_argument("--h_dim",     type=int,   default=32)
     p.add_argument("--num_layers",type=int,   default=None,
                    help="Default: depth+1 (bottleneck convention)")
     p.add_argument("--use_fa_layer", action="store_true",
                    help="Replace last GNN layer with FA layer (baseline only)")
+
+    # GCNII-specific params (only used when --gnn_type GCNII)
+    p.add_argument("--gcnii_alpha",          type=float, default=0.1)
+    p.add_argument("--gcnii_theta",          type=float, default=0.5)
+    p.add_argument("--gcnii_shared_weights", action="store_true", default=True)
+    p.add_argument("--gcnii_dropout",        type=float, default=0.0)
 
     # Router params (router_* models only)
     p.add_argument("--num_routers",  type=int,   default=32)
@@ -70,6 +76,17 @@ def parse_args(argv=None):
     p.add_argument("--fusion",       choices=["add", "residual", "gate"], default="residual")
     p.add_argument("--memory_from_all", action="store_true",
                    help="Build memory from all nodes (router_graph_memory only)")
+
+    # Measure space params (router_graph_memory only)
+    p.add_argument("--use_measure_space",      action="store_true",
+                   help="Apply frozen orthogonal transform before prototype similarity")
+    p.add_argument("--measure_transform_type",
+                   choices=["identity", "frozen_qr_orthogonal", "frozen_hadamard_sign"],
+                   default="frozen_qr_orthogonal")
+    p.add_argument("--measure_apply_mode",
+                   choices=["none", "route_only", "context_only", "route_and_context"],
+                   default="route_only")
+    p.add_argument("--measure_seed", type=int, default=42)
 
     # Training
     p.add_argument("--epochs",       type=int,   default=500)
@@ -129,6 +146,14 @@ def build_model(args, num_classes: int, in_dim: int) -> nn.Module:
         return TNMRouterGraphMemory(
             **router_kwargs,
             memory_from_all=args.memory_from_all,
+            gcnii_alpha=args.gcnii_alpha,
+            gcnii_theta=args.gcnii_theta,
+            gcnii_shared_weights=args.gcnii_shared_weights,
+            gcnii_dropout=args.gcnii_dropout,
+            use_measure_space=args.use_measure_space,
+            measure_transform_type=args.measure_transform_type,
+            measure_apply_mode=args.measure_apply_mode,
+            measure_seed=args.measure_seed,
         )
 
     raise ValueError(args.model)
