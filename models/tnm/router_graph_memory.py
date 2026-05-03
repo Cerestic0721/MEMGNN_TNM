@@ -314,10 +314,12 @@ def _build_graph_memory(
     d = h.size(-1)
     device = h.device
 
-    weighted_h = q.unsqueeze(-1) * h.unsqueeze(1)           # [N, K, d]
-    g_idx = batch.view(-1, 1, 1).expand(-1, K, d)
+    # Avoid materializing [N, K, d] (can be ~8 GiB for deep trees).
+    # Loop over K slots instead: peak memory is [N, d] per iteration.
     M_sum = torch.zeros(num_graphs, K, d, device=device)
-    M_sum.scatter_add_(0, g_idx, weighted_h)
+    b_idx = batch.unsqueeze(-1).expand(-1, d)               # [N, d]
+    for k in range(K):
+        M_sum[:, k, :].scatter_add_(0, b_idx, q[:, k:k+1] * h)
 
     w_sum = torch.zeros(num_graphs, K, device=device)
     w_sum.scatter_add_(0, batch.view(-1, 1).expand(-1, K), q)
