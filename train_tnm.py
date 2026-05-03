@@ -55,6 +55,15 @@ def _bool(v):
     raise argparse.ArgumentTypeError(f"Boolean value expected, got '{v}'")
 
 
+def _gamma_or_learnable(v):
+    """Accept a float, -1, or the string 'learnable' (all map to learnable gamma)."""
+    if isinstance(v, float):
+        return v
+    if str(v).lower() == "learnable":
+        return -1.0
+    return float(v)
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Train MEMGNN_TNM model",
@@ -91,10 +100,13 @@ def parse_args(argv=None):
     p.add_argument("--assign_type",      choices=["dot", "bilinear", "linear_proj"], default="dot")
     p.add_argument("--router_fusion",    choices=["none", "add", "residual", "concat"],
                    default="residual")
-    p.add_argument("--residual_gamma",   type=float, default=0.02,
-                   help="Residual fusion gamma; set to -1 for learnable")
+    p.add_argument("--residual_gamma",   type=_gamma_or_learnable, default=0.1,
+                   help="Residual fusion gamma; -1 or 'learnable' for sigmoid-parameterized learnable gamma")
     p.add_argument("--proto_update",     choices=["grad", "ema"], default="ema")
     p.add_argument("--ema_beta",         type=float, default=0.03)
+    p.add_argument("--ema_init",         choices=["random", "sample_h", "farthest_h", "kmeans_h"],
+                   default="sample_h",
+                   help="Prototype initialization mode for EMA update")
     p.add_argument("--ema_normalize_proto", type=_bool, default=True, metavar="BOOL")
     p.add_argument("--ema_reinit_dead",  type=_bool, default=False, metavar="BOOL")
     p.add_argument("--ema_dead_threshold", type=float, default=1e-4)
@@ -102,8 +114,8 @@ def parse_args(argv=None):
     p.add_argument("--proto_init_mode",  choices=["default", "gaussian_normalized",
                                                    "gaussian_scaled", "qr_orthogonal"],
                    default="default")
-    p.add_argument("--m_step_interval",  type=int,   default=20,
-                   help="EMA update every N outer epochs")
+    p.add_argument("--m_step_interval",  type=int,   default=1,
+                   help="EMA update every N outer epochs (1 = every epoch)")
     p.add_argument("--memory_from_all",  action="store_true",
                    help="Build memory from all nodes (router_graph_memory only)")
 
@@ -191,6 +203,7 @@ def build_model(args, num_classes: int, in_dim: int) -> nn.Module:
         residual_gamma=residual_gamma,
         proto_update=args.proto_update,
         ema_beta=args.ema_beta,
+        ema_init=args.ema_init,
         ema_normalize_proto=args.ema_normalize_proto,
         ema_reinit_dead=args.ema_reinit_dead,
         ema_dead_threshold=args.ema_dead_threshold,
@@ -255,10 +268,6 @@ def _run_steps(model, loader_iter, loader, optimizer, device, n_steps, accum_gra
         logits = model(batch)
         loss = nn.functional.cross_entropy(logits, batch.y)
         (loss / accum_grad).backward()
-
-        # EMA prototype update after backward (avoids inplace version conflict)
-        if hasattr(model, "step_ema"):
-            model.step_ema()
 
         accum_count += 1
 
@@ -340,6 +349,11 @@ def main(argv=None):
             model, loader_iter, train_loader, optimizer, device,
             args.eval_every, args.accum_grad,
         )
+
+        # Epoch-level EMA update: full pass over train_loader, one prototype commit.
+        if hasattr(model, "epoch_ema_update"):
+            model.epoch_ema_update(train_loader, device, quiet=args.quiet)
+
         test_acc = eval_epoch(model, test_loader, device)
         eval_point += 1
 

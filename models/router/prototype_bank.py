@@ -170,6 +170,51 @@ class PrototypeBank(nn.Module):
                 "dead_proto_count": int(dead_now.sum().item()),
             }
 
+    def update_ema_from_mu(self, mu: torch.Tensor, count: torch.Tensor) -> dict:
+        """EMA update from pre-computed per-slot mean mu [K,d] and weight count [K].
+
+        Used by epoch-level EMA where statistics are accumulated over the full dataset
+        before a single prototype update is committed.
+        Assumes ensure_initialized() has already been called by the caller.
+        """
+        if self.proto_update != "ema":
+            return {"ema_update_delta": 0.0, "dead_proto_count": 0}
+
+        with torch.no_grad():
+            old = self.prototypes.detach().clone()
+            active = count > self.ema_min_count
+
+            new = old.clone()
+            if active.any():
+                new[active] = (1.0 - self.ema_beta) * old[active] + self.ema_beta * mu[active]
+            if self.ema_normalize_proto:
+                new = F.normalize(new, p=2, dim=-1)
+
+            usage = count / count.sum().clamp(min=self.ema_min_count)
+            dead_now = usage < self.ema_dead_threshold
+            self._dead_steps = torch.where(
+                dead_now, self._dead_steps + 1, torch.zeros_like(self._dead_steps)
+            )
+            if self.ema_reinit_dead:
+                reinit_mask = self._dead_steps >= self.ema_reinit_patience
+                if reinit_mask.any():
+                    n = int(reinit_mask.sum().item())
+                    gen = self._generator(new.device)
+                    replacements = F.normalize(
+                        torch.randn(n, self.d, generator=gen, device=new.device), p=2, dim=-1
+                    )
+                    new[reinit_mask] = replacements.to(new.dtype)
+                    self._dead_steps[reinit_mask] = 0
+
+            self.prototypes.copy_(new)
+            self._ema_update_count += 1
+            denom = old.norm().clamp(min=self.ema_min_count)
+            delta = (self.prototypes.detach() - old).norm() / denom
+            return {
+                "ema_update_delta": float(delta.item()),
+                "dead_proto_count": int(dead_now.sum().item()),
+            }
+
     def _generator(self, device: torch.device) -> torch.Generator:
         generator = torch.Generator(device=device)
         generator.manual_seed(self.seed + self._sample_offset)
