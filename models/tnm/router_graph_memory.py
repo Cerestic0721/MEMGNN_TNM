@@ -1,16 +1,16 @@
-"""TNMRouterGraphMemory — main Router variant for over-squashing study.
+"""TNMRouterGraphMemory — GCNII + graph-wise prototype memory.
 
-Architecture:
-  GNN layers -> H_all [N, d]
-  Per-graph memory build:
-      M[g, k] = sum_{i in graph g} q[i,k] * H[i] / (sum q[i,k] + eps)
-  Root reads from memory:
-      root_q[g] = RouterAssign(root_h[g])          [num_graphs, K]
-      root_ctx[g] = sum_k root_q[g,k] * M[g,k]    [num_graphs, d]
-  Fuse root_h + root_ctx -> classifier
+Main pipeline:
+  1. key/value embedding -> h0
+  2. GCNII (or GCN/GIN/GAT/GGNN) backbone -> H [N, d]
+  3. All nodes (or non-root) compute sparse assignment q[i,k]
+  4. Per-graph memory: M[g,k] = weighted mean of H over nodes in graph g
+  5. Root reads from memory: root_ctx[g] = sum_k root_q[g,k] * M[g,k]
+  6. Fusion: H_final = fuse(root_h, root_ctx)
+  7. Classifier: logits = Linear(H_final)
+  8. EMA M-step every m_step_interval outer epochs (called from train loop)
 
-Key invariant: M is built per-graph using batch.batch to avoid cross-graph
-contamination. scatter_add is used for efficiency.
+Key invariant: M is built per-graph via batch.batch — no cross-graph contamination.
 """
 
 from __future__ import annotations
@@ -21,7 +21,9 @@ import torch.nn.functional as F
 from torch_geometric.data import Batch
 
 from models.gnn.layers import GNNLayer, GCNIILayer
-from models.router.router_bank import SparseRouterBank
+from models.router.prototype_bank import PrototypeBank
+from models.router.assigner import SoftAssigner
+from models.router.topk_router import TopKRouter
 
 
 class TNMRouterGraphMemory(nn.Module):
@@ -32,24 +34,30 @@ class TNMRouterGraphMemory(nn.Module):
     num_classes:            Number of output classes.
     in_dim:                 Embedding vocab size.
     h_dim:                  Hidden dimension.
-    num_layers:             Number of GNN layers.
+    num_layers:             Number of GNN/GCNII layers.
     gnn_type:               GCN | GIN | GAT | GGNN | GCNII.
-    num_routers:            Number of memory slots K.
-    topk:                   Top-k active slots per node.
-    tau:                    Softmax temperature.
-    ema_beta:               EMA decay.
-    update_mode:            'grad' or 'ema'.
-    init_mode:              Prototype initialization mode.
-    fusion:                 'add' | 'residual' | 'gate'.
-    memory_from_all:        If True, build memory from all nodes; if False, from
-                            non-root nodes only.
-    gcnii_alpha:            GCNII initial residual weight (GCNII only).
-    gcnii_theta:            GCNII identity mapping strength (GCNII only).
-    gcnii_shared_weights:   Share W_1/W_2 in GCN2Conv (GCNII only).
-    gcnii_dropout:          Dropout inside each GCNII layer (GCNII only).
+    dropout:                Dropout on embeddings and GCNII layers.
+    num_routers:            Number of prototype slots K.
+    topk_assign:            Top-k active slots per node.
+    assignment_tau:         Softmax temperature for assignment.
+    assign_type:            dot | bilinear | linear_proj.
+    router_fusion:          none | add | residual | concat.
+    residual_gamma:         Scalar for residual fusion (None = learnable).
+    proto_update:           grad | ema.
+    ema_beta:               EMA decay (CMMP default: 0.03).
+    ema_normalize_proto:    L2-normalize prototypes after EMA update.
+    ema_reinit_dead:        Reinitialize dead prototypes.
+    ema_dead_threshold:     Usage threshold below which a prototype is dead.
+    ema_reinit_patience:    Steps before reinitializing a dead prototype.
+    proto_init_mode:        default | gaussian_normalized | gaussian_scaled | qr_orthogonal.
+    m_step_interval:        EMA update every N outer epochs (called externally).
+    memory_from_all:        Build memory from all nodes (True) or non-root only (False).
+    gcnii_alpha:            GCNII initial residual weight.
+    gcnii_theta:            GCNII identity mapping strength.
+    gcnii_shared_weights:   Share W_1/W_2 in GCN2Conv.
     use_measure_space:      Apply frozen orthogonal transform before similarity.
-    measure_transform_type: 'identity' | 'frozen_qr_orthogonal' | 'frozen_hadamard_sign'.
-    measure_apply_mode:     'none' | 'route_only' | 'context_only' | 'route_and_context'.
+    measure_transform_type: identity | frozen_qr_orthogonal | frozen_hadamard_sign.
+    measure_apply_mode:     none | route_only | context_only | route_and_context.
     measure_seed:           RNG seed for the frozen transform matrix.
     """
 
@@ -57,31 +65,42 @@ class TNMRouterGraphMemory(nn.Module):
         self,
         num_classes: int,
         in_dim: int,
-        h_dim: int = 32,
-        num_layers: int = 4,
-        gnn_type: str = "GCN",
-        num_routers: int = 32,
-        topk: int = 4,
-        tau: float = 1.0,
-        ema_beta: float = 0.9,
-        update_mode: str = "ema",
-        init_mode: str = "default",
-        fusion: str = "residual",
-        memory_from_all: bool = True,
-        gcnii_alpha: float = 0.1,
-        gcnii_theta: float = 0.5,
+        h_dim: int = 512,
+        num_layers: int = 16,
+        gnn_type: str = "GCNII",
+        dropout: float = 0.7,
+        num_routers: int = 128,
+        topk_assign: int = 16,
+        assignment_tau: float = 1.0,
+        assign_type: str = "dot",
+        router_fusion: str = "residual",
+        residual_gamma: float | None = 0.02,
+        proto_update: str = "ema",
+        ema_beta: float = 0.03,
+        ema_normalize_proto: bool = True,
+        ema_reinit_dead: bool = False,
+        ema_dead_threshold: float = 1e-4,
+        ema_reinit_patience: int = 20,
+        proto_init_mode: str = "default",
+        m_step_interval: int = 20,
+        memory_from_all: bool = False,
+        gcnii_alpha: float = 0.2,
+        gcnii_theta: float = 1.0,
         gcnii_shared_weights: bool = True,
-        gcnii_dropout: float = 0.0,
         use_measure_space: bool = False,
         measure_transform_type: str = "frozen_qr_orthogonal",
         measure_apply_mode: str = "route_only",
         measure_seed: int = 42,
     ):
         super().__init__()
-        self.num_layers = num_layers
-        self.update_mode = update_mode
+        self.h_dim = h_dim
+        self.dropout = dropout
         self.memory_from_all = memory_from_all
+        self.m_step_interval = m_step_interval
+        self.assignment_tau = assignment_tau
+        self.router_fusion = router_fusion
         self.use_gcnii = gnn_type.upper() == "GCNII"
+        self._outer_epoch = 0
 
         self.key_embedding   = nn.Embedding(in_dim + 1, h_dim)
         self.value_embedding = nn.Embedding(in_dim + 1, h_dim)
@@ -94,7 +113,7 @@ class TNMRouterGraphMemory(nn.Module):
                     theta=gcnii_theta,
                     layer=i + 1,
                     shared_weights=gcnii_shared_weights,
-                    dropout=gcnii_dropout,
+                    dropout=dropout,
                 )
                 for i in range(num_layers)
             ])
@@ -103,25 +122,79 @@ class TNMRouterGraphMemory(nn.Module):
                 GNNLayer(gnn_type, h_dim, h_dim) for _ in range(num_layers)
             ])
 
-        self.router = SparseRouterBank(
-            dim=h_dim, num_routers=num_routers, topk=topk,
-            tau=tau, ema_beta=ema_beta, update_mode=update_mode,
-            init_mode=init_mode,
-            use_measure_space=use_measure_space,
-            measure_transform_type=measure_transform_type,
-            measure_apply_mode=measure_apply_mode,
-            measure_seed=measure_seed,
+        self.proto_bank = PrototypeBank(
+            num_prototypes=num_routers,
+            hidden_dim=h_dim,
+            proto_update=proto_update,
+            ema_beta=ema_beta,
+            ema_normalize_proto=ema_normalize_proto,
+            ema_reinit_dead=ema_reinit_dead,
+            ema_dead_threshold=ema_dead_threshold,
+            ema_reinit_patience=ema_reinit_patience,
+            proto_init_mode=proto_init_mode,
         )
 
-        self.fusion = fusion
-        if fusion == "gate":
-            self.gate_proj = nn.Linear(h_dim * 2, h_dim)
+        self.assigner = SoftAssigner(h_dim, num_routers, assign_type)
+        self.topk_router = TopKRouter(topk_assign)
+
+        self.use_measure_space = use_measure_space
+        self.measure_apply_mode = measure_apply_mode
+        measure_matrix = self._build_measure_matrix(
+            h_dim, use_measure_space, measure_transform_type, measure_seed
+        )
+        self.register_buffer("measure_matrix", measure_matrix)
+
+        if router_fusion == "concat":
+            self.concat_proj = nn.Linear(h_dim * 2, h_dim)
+        if router_fusion == "residual":
+            if residual_gamma is None:
+                self.residual_gamma = nn.Parameter(torch.tensor(0.02))
+            else:
+                self.register_buffer("residual_gamma", torch.tensor(float(residual_gamma)))
 
         self.classifier = nn.Linear(h_dim, num_classes)
 
+    @staticmethod
+    def _build_measure_matrix(
+        d: int, use: bool, transform_type: str, seed: int
+    ) -> torch.Tensor:
+        if not use or transform_type == "identity":
+            return torch.eye(d)
+        if transform_type == "frozen_qr_orthogonal":
+            gen = torch.Generator(device="cpu")
+            gen.manual_seed(seed)
+            gaussian = torch.randn(d, d, generator=gen)
+            q, r = torch.linalg.qr(gaussian)
+            signs = torch.sign(torch.diag(r))
+            signs = torch.where(signs == 0, torch.ones_like(signs), signs)
+            return q * signs.unsqueeze(0)
+        if d & (d - 1) != 0:
+            raise ValueError("frozen_hadamard_sign requires hidden_dim to be a power of two")
+        hadamard = torch.tensor([[1.0]])
+        while hadamard.size(0) < d:
+            hadamard = torch.cat([
+                torch.cat([hadamard, hadamard], dim=1),
+                torch.cat([hadamard, -hadamard], dim=1),
+            ], dim=0)
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(seed)
+        signs = (torch.randint(0, 2, (d,), generator=gen, dtype=torch.float32)
+                 .mul_(2.0).sub_(1.0))
+        return (hadamard / d ** 0.5) * signs.unsqueeze(0)
+
+    def _route_prototypes(self, P: torch.Tensor) -> torch.Tensor:
+        if self.use_measure_space and self.measure_apply_mode in ("route_only", "route_and_context"):
+            return P @ self.measure_matrix.to(P.device, P.dtype)
+        return P
+
+    def _context_prototypes(self, P: torch.Tensor) -> torch.Tensor:
+        if self.use_measure_space and self.measure_apply_mode in ("context_only", "route_and_context"):
+            return P @ self.measure_matrix.to(P.device, P.dtype)
+        return P
+
     def _encode(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        """Run embedding + GNN layers, returning final node embeddings."""
         h0 = self.key_embedding(x[:, 0]) + self.value_embedding(x[:, 1])
+        h0 = F.dropout(h0, self.dropout, training=self.training)
         h = h0
         if self.use_gcnii:
             for layer in self.layers:
@@ -131,49 +204,93 @@ class TNMRouterGraphMemory(nn.Module):
                 h = layer(h, edge_index)
         return h
 
+    def _assign(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        P = self.proto_bank()
+        P_route = self._route_prototypes(P)
+        logits = self.assigner.logits(h, P_route) / self.assignment_tau
+        q_dense = F.softmax(logits, dim=-1)
+        q_sparse = self.topk_router(q_dense)
+        return q_dense, q_sparse
+
     def forward(self, batch: Batch) -> torch.Tensor:
         x, edge_index = batch.x, batch.edge_index
-        root_mask = batch.root_mask   # [N] bool
-        b = batch.batch               # [N] graph index
+        root_mask = batch.root_mask
+        b = batch.batch
         num_graphs = int(b.max().item()) + 1
-        K = self.router.num_routers
+        K = self.proto_bank.K
 
         h = self._encode(x, edge_index)
 
-        # --- Build per-graph memory ---
         if self.memory_from_all:
-            h_mem = h
-            b_mem = b
+            h_mem, b_mem = h, b
         else:
             non_root = ~root_mask
-            h_mem = h[non_root]
-            b_mem = b[non_root]
+            h_mem, b_mem = h[non_root], b[non_root]
 
-        _, q_sparse = self.router.compute_assignment(h_mem)  # [N_mem, K]
+        self.proto_bank.ensure_initialized(h_mem)
+        _, q_sparse = self._assign(h_mem)
 
-        # EMA update on memory nodes
-        if self.training and self.update_mode == "ema":
-            self.router.ema_update(h_mem, q_sparse)
+        # Store for post-backward EMA update (called by train loop via step_ema)
+        if self.training and self.proto_bank.proto_update == "ema":
+            self._last_h_mem = h_mem.detach()
+            self._last_q_sparse = q_sparse.detach()
 
-        # M[g, k] = weighted mean of h over nodes in graph g for slot k
-        # Shape: [num_graphs, K, d]
-        M = _build_graph_memory(h_mem, q_sparse, b_mem, num_graphs, K)
+        P_ctx = self._context_prototypes(self.proto_bank())
+        M = _build_graph_memory(h_mem, q_sparse, b_mem, num_graphs, K, P_ctx)
 
-        # --- Root reads from memory ---
-        root_h = h[root_mask]                                # [G, d]
-        root_q_dense, root_q_sparse = self.router.compute_assignment(root_h)
-        # [G, K] x [G, K, d] -> [G, d]
-        root_ctx = (root_q_sparse.unsqueeze(-1) * M).sum(1)  # [G, d]
+        root_h = h[root_mask]
+        _, root_q = self._assign(root_h)
+        root_ctx = (root_q.unsqueeze(-1) * M).sum(1)   # [G, d]
 
-        fused = _fuse(root_h, root_ctx, self.fusion,
-                      getattr(self, "gate_proj", None))
+        fused = self._fuse(root_h, root_ctx)
         return self.classifier(fused)
 
-    def router_stats(self, batch: Batch):
-        with torch.no_grad():
-            h = self._encode(batch.x, batch.edge_index)
-            _, q_sparse = self.router.compute_assignment(h)
-            return self.router.stats(q_sparse)
+    def step_ema(self) -> dict:
+        """Call after loss.backward() to update prototypes via EMA.
+
+        Only updates when outer_epoch % m_step_interval == 0.
+        """
+        if not self._should_update_ema():
+            return {}
+        h = getattr(self, "_last_h_mem", None)
+        q = getattr(self, "_last_q_sparse", None)
+        if h is None or q is None:
+            return {}
+        return self.proto_bank.update_ema(h, q)
+
+    def _should_update_ema(self) -> bool:
+        if self.proto_bank.proto_update != "ema":
+            return False
+        return self._outer_epoch % self.m_step_interval == 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self._outer_epoch = int(epoch)
+
+    def _fuse(self, h: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        mode = self.router_fusion
+        if mode == "none":
+            return h
+        if mode == "add":
+            return h + c
+        if mode == "residual":
+            return h + self.residual_gamma * c
+        if mode == "concat":
+            return self.concat_proj(torch.cat([h, c], dim=-1))
+        raise ValueError(f"Unknown router_fusion '{mode}'")
+
+    @torch.no_grad()
+    def router_stats(self, batch: Batch) -> dict:
+        h = self._encode(batch.x, batch.edge_index)
+        _, q_sparse = self._assign(h)
+        usage = (q_sparse > 1e-6).float().mean(0)
+        active_count = float((usage > 0).sum().item())
+        entropy = -(q_sparse * (q_sparse + 1e-9).log()).sum(-1).mean().item()
+        dead_ratio = float((usage < 1e-4).float().mean().item())
+        return {
+            "active_router_num": active_count,
+            "dead_router_ratio": dead_ratio,
+            "assignment_entropy": entropy,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -181,54 +298,31 @@ class TNMRouterGraphMemory(nn.Module):
 # ---------------------------------------------------------------------------
 
 def _build_graph_memory(
-    h: torch.Tensor,       # [N, d]
-    q: torch.Tensor,       # [N, K]
-    batch: torch.Tensor,   # [N]
+    h: torch.Tensor,
+    q: torch.Tensor,
+    batch: torch.Tensor,
     num_graphs: int,
     K: int,
+    P_ctx: torch.Tensor,
 ) -> torch.Tensor:
     """Build M[g, k] = weighted mean of h for graph g, slot k.
 
-    Returns
-    -------
-    M : [num_graphs, K, d]
+    Falls back to prototype P_ctx for slots with zero weight.
+
+    Returns M : [num_graphs, K, d]
     """
     d = h.size(-1)
     device = h.device
 
-    # Weighted sum: [N, K, d] -> scatter to [G, K, d]
-    # q: [N, K], h: [N, d]
-    # weighted_h[i, k, :] = q[i, k] * h[i, :]
-    weighted_h = q.unsqueeze(-1) * h.unsqueeze(1)   # [N, K, d]
-
-    # scatter_add over graph dimension
-    g_idx = batch.view(-1, 1, 1).expand(-1, K, d)   # [N, K, d]
+    weighted_h = q.unsqueeze(-1) * h.unsqueeze(1)           # [N, K, d]
+    g_idx = batch.view(-1, 1, 1).expand(-1, K, d)
     M_sum = torch.zeros(num_graphs, K, d, device=device)
     M_sum.scatter_add_(0, g_idx, weighted_h)
 
-    # Normalize by total weight per (graph, slot)
     w_sum = torch.zeros(num_graphs, K, device=device)
     w_sum.scatter_add_(0, batch.view(-1, 1).expand(-1, K), q)
-    w_sum = w_sum.clamp(min=1e-9).unsqueeze(-1)      # [G, K, 1]
 
-    return M_sum / w_sum                              # [G, K, d]
-
-
-# ---------------------------------------------------------------------------
-# Fusion
-# ---------------------------------------------------------------------------
-
-def _fuse(
-    h: torch.Tensor,
-    c: torch.Tensor,
-    mode: str,
-    gate_proj: nn.Module | None,
-) -> torch.Tensor:
-    if mode == "add":
-        return h + c
-    if mode == "residual":
-        return F.relu(h + c)
-    if mode == "gate":
-        g = torch.sigmoid(gate_proj(torch.cat([h, c], dim=-1)))
-        return g * h + (1 - g) * c
-    raise ValueError(f"Unknown fusion mode '{mode}'")
+    zero_mask = (w_sum < 1e-9).unsqueeze(-1)                 # [G, K, 1]
+    M_norm = M_sum / w_sum.clamp(min=1e-9).unsqueeze(-1)
+    M_fallback = P_ctx.unsqueeze(0).expand(num_graphs, -1, -1)
+    return torch.where(zero_mask, M_fallback, M_norm)

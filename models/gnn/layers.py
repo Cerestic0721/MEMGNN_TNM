@@ -65,15 +65,15 @@ class GNNLayer(nn.Module):
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         h = self.conv(x, edge_index)
 
+        if self.use_activation:
+            h = F.relu(h)
+
         if self.use_residual:
             res = self.residual_proj(x) if self.residual_proj is not None else x
             h = h + res
 
         if self.use_layer_norm:
             h = self.norm(h)
-
-        if self.use_activation:
-            h = F.relu(h)
 
         return h
 
