@@ -18,6 +18,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from torch_geometric.data import Batch
 
 from models.gnn.layers import GNNLayer, GCNIILayer
@@ -198,7 +199,11 @@ class TNMRouterGraphMemory(nn.Module):
         h = h0
         if self.use_gcnii:
             for layer in self.layers:
-                h = layer(h, h0, edge_index)
+                if self.training:
+                    # Recompute activations during backward instead of storing all 16 layers.
+                    h = grad_checkpoint(layer, h, h0, edge_index, use_reentrant=False)
+                else:
+                    h = layer(h, h0, edge_index)
         else:
             for layer in self.layers:
                 h = layer(h, edge_index)
